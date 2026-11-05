@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#1d140e" />
+  <rect x="60" y="250" width="1080" height="320" rx="24" fill="#140d09" />
+  <g stroke="#ffb547" stroke-opacity="0.1" stroke-width="2">
+    <path d="M60 330H1140M60 410H1140M60 490H1140M180 250V570M300 250V570M420 250V570M540 250V570M660 250V570M780 250V570M900 250V570M1020 250V570" />
+  </g>
+  <path d="M60 470 C140 470 170 360 240 350 S340 330 400 340 S470 520 520 530 L620 530 C660 530 680 380 740 360 S860 320 920 330 S1040 400 1140 380" fill="none" stroke="#ffb547" stroke-width="8" stroke-linecap="round" />
+  <path d="M60 480 C140 476 180 372 250 362 S350 344 410 352 S470 510 520 520" fill="none" stroke="#74f0c4" stroke-width="6" stroke-linecap="round" />
+  <text x="60" y="140" fill="#f5e9d8" font-family="system-ui, sans-serif" font-size="84" font-weight="700">Hamster Pacer: Echo</text>
+  <text x="60" y="205" fill="#c9b29a" font-family="system-ui, sans-serif" font-size="36">Tap along to the real speed of Squeektoshi's wheel runs</text>
+  <g shape-rendering="crispEdges" transform="translate(1000 60) scale(12)">
+    <rect x="3" y="2" width="5" height="1" fill="#e0a060" />
+    <rect x="2" y="3" width="9" height="5" fill="#e0a060" />
+    <rect x="9" y="3" width="2" height="4" fill="#e0a060" />
+    <rect x="11" y="4" width="1" height="2" fill="#e0a060" />
+    <rect x="8" y="1" width="2" height="2" fill="#8a5a2b" />
+    <rect x="9" y="1" width="1" height="1" fill="#f2a0a0" />
+    <rect x="4" y="6" width="5" height="2" fill="#f6e3c4" />
+    <rect x="9" y="4" width="1" height="1" fill="#1d140e" />
+    <rect x="12" y="5" width="1" height="1" fill="#f2a0a0" />
+    <rect x="1" y="5" width="1" height="1" fill="#8a5a2b" />
+    <rect x="3" y="8" width="1" height="1" fill="#8a5a2b" />
+    <rect x="8" y="8" width="1" height="1" fill="#8a5a2b" />
+  </g>
+</svg>

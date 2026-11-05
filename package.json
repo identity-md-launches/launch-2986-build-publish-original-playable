@@ -1,0 +1,15 @@
+{
+  "name": "hamster-pacer-echo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hamster Pacer: Echo, a tempo-tracing browser game on Squeektoshi's real hamster-wheel runs. Unofficial Squeekchain fan game.",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "node --check src/app.js && node --check src/logic.js && node scripts/check.mjs",
+    "preview": "node scripts/preview.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
