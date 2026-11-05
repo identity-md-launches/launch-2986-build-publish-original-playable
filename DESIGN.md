@@ -63,7 +63,8 @@ measured in a browser.
 - Play mode adds `body.is-playing`, which hides everything marked `.home`. The play section stacks
   title + Quit, HUD (wrapping flex), progress bar, the scope canvas
   (`height: clamp(220px, 42vh, 440px)`), a hint line and the full-width tap pad (120px tall).
-- Long values wrap (`overflow-wrap: anywhere` on play title and stat values); nothing truncates.
+- Long values wrap (`overflow-wrap: anywhere` on the play title, stat values and the `.player-name`
+  greeting on the result card); nothing truncates.
 
 ## Elevation & Depth
 
@@ -101,7 +102,8 @@ circle for the breathing light. Pixel art uses `shape-rendering="crispEdges"`.
   82% for the live duet, and dots where both traces cross the playhead.
 - **HUD** `.hud`: Score, Flow, You, Him in mono numbers, plus the grade word (`.grade[data-grade]`).
 - **Tap pad** `#pad`: a native button driven by `pointerdown` (with `touch-action: manipulation`).
-  Space taps from anywhere in play mode; Enter taps when the pad has focus.
+  Space taps from anywhere in play mode; Enter taps when the pad has focus. A `click` with no pointer
+  or Space input in the previous 500ms also taps, so assistive activation works and no tap counts twice.
 - **Result card** `#result`: focusable region. Holds a stats `dl.stats`, a real-run `dl.stats.facts`,
   the share preview (`.share` with an `ol.grid` of ten `.sq.gold|silver|miss`) and the copy button,
   whose status line is `role="status"`.
@@ -109,6 +111,8 @@ circle for the breathing light. Pixel art uses `shape-rendering="crispEdges"`.
   motion), countdown `.lull-time`.
 - **Sticker tile** `.stickers li` with `.sticker-art` (pixel face over `--hue`); `.locked` greys it.
 - **Toast** `#toast` (`role="status"`, polite) for stickers, block bonuses and pause-tap warnings.
+  Toasts queue and each shows for 2.8 seconds, so none replaces another; a text already waiting is not
+  queued twice.
 - **Tutorial** `<dialog id="tutorial">`: three cards, Skip / Back / Next. Native `showModal()` traps
   focus and Escape closes it.
 - **Live wheel** `.wheel` in the header: the SVG spokes rotate once per `60 / rpm` seconds from

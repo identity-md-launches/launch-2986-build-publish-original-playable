@@ -6,8 +6,7 @@ export const DAY_MS = 86400000;
 export const PACER_EPOCH_DAY = Math.floor(Date.UTC(2026, 10, 3) / DAY_MS);
 export const RUN_GAP_MS = 60000; // passages further apart than this belong to different runs
 export const PAUSE_GAP_S = 4; // a gap longer than this inside a run is a pause (0 RPM)
-export const MIN_RUN_PASSAGES = 12;
-export const MIN_RUN_SECONDS = 15;
+export const STATUS_MAX_AGE_MS = 15000; // a status reading older than this no longer counts as live
 export const TRACK_STEP_S = 0.5;
 export const TAP_WINDOW_MS = 3000;
 export const GOLD_TOL = 0.08;
@@ -35,9 +34,11 @@ export function buildRuns(segments) {
   let current = [];
   let prev = -Infinity;
   const close = () => {
-    if (current.length >= MIN_RUN_PASSAGES) {
+    // Two passages are enough for a speed; makeTrack stretches short runs to 45 seconds of play.
+    // A run whose every gap is a pause has no speed to trace, so it is not a track.
+    if (current.length >= 2) {
       const run = makeRun(current);
-      if (run.durS >= MIN_RUN_SECONDS) runs.push(run);
+      if (run.top > 0) runs.push(run);
     }
     current = [];
   };
@@ -266,4 +267,46 @@ export function liveOf(status) {
     observedAt: Date.parse(m.observedAt) || null,
     block: blockHeightOf(status),
   };
+}
+
+// A reading can be used only if it has a state and arrived recently.
+export function readingUsable(live, receivedAt, now) {
+  return Boolean(live && live.core) && now - receivedAt <= STATUS_MAX_AGE_MS;
+}
+
+// Live Duet and Lullaby also need the API to call the wheel's data fresh.
+export function readingOnline(live, receivedAt, now) {
+  return readingUsable(live, receivedAt, now) && live.freshness === 'online';
+}
+
+// Rejects after ms even if the work never settles, and tells that work to stop through its signal.
+export function withTimeout(ms, work) {
+  const controller = new AbortController();
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`no answer within ${ms / 1000} seconds`));
+      controller.abort();
+    }, ms);
+  });
+  return Promise.race([work(controller.signal), expired]).finally(() => clearTimeout(timer));
+}
+
+// Follows nextCursor until the API has no more pages. `known` holds pages from an earlier read:
+// the last one is read again, because it may have grown, and later pages are added after it.
+// Any failure rejects, so a caller never mistakes a partial history for the whole one.
+export async function readAllPages(readPage, known = [], onPage = () => {}) {
+  const pages = known.slice(0, -1);
+  const seen = new Set(pages.map((p) => p.cursor));
+  let cursor = known.length ? known[known.length - 1].cursor : null;
+  for (;;) {
+    if (seen.has(cursor)) throw new Error('the API repeated a page cursor');
+    seen.add(cursor);
+    const json = await readPage(cursor);
+    if (!Array.isArray(json.items)) throw new Error('the runs response had no items list');
+    pages.push({ cursor, items: json.items });
+    onPage(pages.length);
+    cursor = json.nextCursor;
+    if (cursor == null || cursor === '') return { pages, meta: json };
+  }
 }

@@ -12,6 +12,11 @@ const test = (name, fn) => {
   passed++;
   console.log(`ok ${passed} ${name}`);
 };
+const asyncTest = async (name, fn) => {
+  await fn();
+  passed++;
+  console.log(`ok ${passed} ${name}`);
+};
 
 // A synthetic passage list shaped like /v1/measurement/runs items (test input only, never shown in the UI).
 const seg = (times, discontinuity = false) => ({
@@ -31,11 +36,21 @@ test('buildRuns turns passages into one run with RPM per second', () => {
   assert.ok(Math.abs(runs[0].top - 60) < 0.001);
 });
 
-test('a gap over 60 s or a discontinuity starts a new run; short runs are dropped', () => {
+test('a gap over 60 s or a discontinuity starts a new run', () => {
   const later = steady.map((t) => t + 200000);
   assert.equal(L.buildRuns([seg(steady), seg(later)]).length, 2);
   assert.equal(L.buildRuns([seg(steady.slice(0, 20)), seg(steady.slice(20), true)]).length, 2);
-  assert.equal(L.buildRuns([seg(steady.slice(0, 5))]).length, 0);
+});
+
+test('short runs stay and become 45-second tracks; runs with no speed do not', () => {
+  const [run] = L.buildRuns([seg(steady.slice(0, 11), true)]);
+  assert.equal(run.durS, 10);
+  const track = L.makeTrack(run);
+  assert.equal(track.playS, 45);
+  assert.ok(Math.abs(L.rpmAt(track, 44) - 60) < 0.001);
+  assert.equal(L.buildRuns([seg(steady.slice(0, 2))]).length, 1);
+  assert.equal(L.buildRuns([seg(steady.slice(0, 1))]).length, 0);
+  assert.equal(L.buildRuns([seg([t0, t0 + 30000])]).length, 0);
 });
 
 test('a pause inside a run reads as 0 RPM and is counted', () => {
@@ -112,6 +127,68 @@ test('streaks, names and live status parsing', () => {
   assert.equal(live.rpm, 66.5);
   assert.equal(live.block, 155);
   assert.equal(L.blockHeightOf({ builder: { anchor: { blockHeight: '130' } } }), 130);
+});
+
+test('a reading needs a state, a recent arrival and online freshness', () => {
+  const online = { core: 'IDLE', freshness: 'online' };
+  assert.equal(L.readingOnline(online, 1000, 1000 + L.STATUS_MAX_AGE_MS), true);
+  assert.equal(L.readingOnline(online, 1000, 1001 + L.STATUS_MAX_AGE_MS), false);
+  assert.equal(L.readingOnline({ core: 'IDLE', freshness: 'offline' }, 1000, 1000), false);
+  assert.equal(L.readingUsable({ core: 'IDLE', freshness: 'offline' }, 1000, 1000), true);
+  assert.equal(L.readingUsable({ core: null }, 1000, 1000), false);
+  assert.equal(L.readingUsable(null, 1000, 1000), false);
+});
+
+await asyncTest('withTimeout rejects work that never settles and aborts it', async () => {
+  let signal;
+  await assert.rejects(
+    L.withTimeout(20, (s) => {
+      signal = s;
+      return new Promise(() => {});
+    }),
+    /no answer within 0.02 seconds/,
+  );
+  assert.equal(signal.aborted, true);
+  assert.equal(await L.withTimeout(1000, async () => 'done'), 'done');
+});
+
+await asyncTest('readAllPages follows nextCursor past 60 pages and through short pages', async () => {
+  const asked = [];
+  const readPage = async (cursor) => {
+    asked.push(cursor);
+    const n = cursor === null ? 0 : Number(cursor);
+    return { items: n === 3 ? [] : [{ n }], nextCursor: n < 60 ? String(n + 1) : null, latestObservedAt: 'end' };
+  };
+  const { pages, meta } = await L.readAllPages(readPage);
+  assert.equal(pages.length, 61);
+  assert.equal(asked[60], '60');
+  assert.equal(meta.latestObservedAt, 'end');
+});
+
+await asyncTest('readAllPages re-reads the last known page and keeps earlier ones', async () => {
+  const asked = [];
+  const known = [
+    { cursor: null, items: ['a'] },
+    { cursor: '1', items: ['b'] },
+  ];
+  const readPage = async (cursor) => {
+    asked.push(cursor);
+    return cursor === '1' ? { items: ['b', 'c'], nextCursor: '2' } : { items: ['d'], nextCursor: null };
+  };
+  const { pages } = await L.readAllPages(readPage, known);
+  assert.deepEqual(asked, ['1', '2']);
+  assert.deepEqual(pages.flatMap((p) => p.items), ['a', 'b', 'c', 'd']);
+});
+
+await asyncTest('readAllPages rejects a failed page and a repeated cursor instead of returning a prefix', async () => {
+  await assert.rejects(
+    L.readAllPages(async (cursor) => {
+      if (cursor === '1') throw new Error('HTTP 500');
+      return { items: [], nextCursor: '1' };
+    }),
+    /HTTP 500/,
+  );
+  await assert.rejects(L.readAllPages(async () => ({ items: [], nextCursor: 'same' })), /repeated a page cursor/);
 });
 
 test('dist/ matches src/ and uses relative asset URLs', () => {

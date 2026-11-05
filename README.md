@@ -8,7 +8,9 @@ wallet, no contracts, no betting, no prizes.
 
 - **Daily Track:** the longest completed run from the previous UTC day, shown as `Pacer #<n>`
   (Pacer #1 is 2026-11-03 UTC, the start date in the API's `installationId`). If the API has no
-  completed run for that day, the panel says so and offers his newest recorded run instead.
+  completed run for that day, the panel says so and offers his newest recorded run instead. An open
+  tab reads newer pages and picks again at UTC midnight, and whenever Daily opens with a list over a
+  minute old. A session already started keeps its Pacer number and streak day.
 - **Tempo tracing:** his real RPM scrolls right to left on a seismograph canvas (amber), squeezed or
   stretched into 45 to 90 seconds of play. Tap Space, Enter on the focused pad, or the big pad on
   touch screens. Your RPM is the tap rate over a rolling 3-second window (mint line).
@@ -23,9 +25,12 @@ wallet, no contracts, no betting, no prizes.
   `measurement.freshness` is `online`) you can start a **Live Duet**: the curve is drawn from
   `measurement.rpmMilli / 1000` as it arrives, and each rise in `builder.projected.blockHeight`
   (falling back to `builder.anchor.blockHeight`) adds 250 x Flow with a toast naming the block.
-  While `IDLE` the tab becomes **Lullaby**: a moon and a breathing circle, and 60 quiet seconds earn
-  the "Good roommate" sticker. Any key or tap simply restarts the minute; nothing is lost.
-  `COUNTER_FAULT` or a failed request turns live play off and says why.
+  While `IDLE` (and `online`) the tab becomes **Lullaby**: a moon and a breathing circle, and 60 quiet
+  seconds earn the "Good roommate" sticker. Any key or tap simply restarts the minute; nothing is lost.
+- **Live data guard:** a status request is abandoned after 8 seconds and a reading expires after 15.
+  `COUNTER_FAULT`, a failed or unanswered request, an expired reading, or any freshness other than
+  `online` turns live play off and says why. A running duet ends with that reason, and Lullaby stops
+  without earning its sticker.
 - **Progress** (localStorage key `hamster-pacer-echo.v1`): 10 stickers, best score per track, Daily
   streak, a pacer name (max 20 characters, rendered with `textContent` only), sound and
   reduced-motion settings, and whether the 3-card tutorial was seen.
@@ -38,7 +43,9 @@ Both endpoints were checked live on 2026-11-05 (UTC):
   `{ items, nextCursor, latestObservedAt, coverageStartAt, coverageThroughAt, … }`. Each item is a
   short measurement segment with `passages[].at` timestamps, `discontinuity` and
   `measurementEligible`. `limit` above 100 and other query parameters (`since`, `from`, `order`)
-  return HTTP 400, so the game pages forward with `nextCursor` (up to 60 pages, 6,000 segments).
+  return HTTP 400, so the game follows `nextCursor` until the API has no more pages. Each page gets
+  a 20-second limit and up to two retries; if a page still fails, Daily and Setlist say so rather
+  than treat a partial history as the whole one.
 - `GET https://api.squeekchain.com/v1/status` returns `measurement.coreStatus`,
   `measurement.rpmMilli`, `measurement.freshness`, `builder.projected.blockHeight` and
   `builder.anchor.blockHeight`, as the brief describes.
@@ -46,8 +53,8 @@ Both endpoints were checked live on 2026-11-05 (UTC):
 **How runs are built** (`src/logic.js`): all passages are sorted and split into runs wherever two
 passages are more than 60 seconds apart or a segment is flagged `discontinuity`. Each passage is
 taken as one wheel revolution, so RPM is 60 / seconds between passages; a gap over 4 seconds inside
-a run is a pause (0 RPM). Runs with fewer than 12 passages or under 15 seconds are not playable.
-"Completed" means the run ended at least 60 seconds before the API's `latestObservedAt`.
+a run is a pause (0 RPM). Any run with at least one gap of 4 seconds or less has a speed and becomes
+a track, however short. "Completed" means the run ended at least 60 seconds before the API's `latestObservedAt`.
 
 Nothing is simulated. If a request fails, the affected modes are disabled with the reason on screen.
 
@@ -82,18 +89,21 @@ artifacts/validation.md   what was checked, what was not, and why
 
 ## Validation status (honest summary)
 
-This work was written in a session where the shell sandbox and the browser tool both failed to
-start (`Failed to create bridge sockets`, and Chrome aborting with `Socket path too long`). So **no
-command in this repository has been run yet**: not `npm run build`, not `npm run check`, not the
-design probe. `dist/` was written file by file as an exact copy of `src/`; a line count of every file
-matches, but `npm run check` (which compares the bytes) has not run. The API field names were checked
-live through a web fetch tool. See `artifacts/validation.md` for the full record and the commands to
-run first.
+This work and its revision were written in sessions where the shell sandbox and the browser tool both
+failed to start (`Failed to create bridge sockets`, and `Socket directory path is too long`). So **no
+command in this repository has been run by its author**: not `npm run build`, not `npm run check`, not
+the design probe, and nothing was opened in a browser. `dist/` was edited by hand to match `src/`. In
+the revision session the API also answered the web fetch tool with HTTP 403, so its field names rest
+on the earlier live check. See `artifacts/validation.md` for the full record and the commands to run
+first.
 
 ## Limitations
 
-- The run list is read oldest-first through cursor pages; past 6,000 segments the newest runs would
-  be cut off. The API currently offers no newest-first or date filter.
+- The run list is read oldest-first through cursor pages, because the API offers no newest-first or
+  date filter. The first load therefore takes one request per page of history.
+- Short runs are now tracks, so bursts of a few seconds can fill the Setlist's last 20 entries.
+- Live modes require `measurement.freshness` to be `online`. If the API reports another value while
+  he is simply resting, Lullaby stays off and says so.
 - `og:image` is an SVG (`og.svg`) with a relative URL. Some link unfurlers (including X) need a PNG at
   an absolute URL; add `og.png` and an absolute URL once the site's final address is known.
 - Treating each passage as one revolution is an inference from the hardware counter; if the counter

@@ -1,7 +1,9 @@
 // Hamster Pacer: Echo. DOM, canvas and game loop. Pure rules live in logic.js.
 import {
   API,
+  DAY_MS,
   REST_RPM,
+  STATUS_MAX_AGE_MS,
   accuracy,
   buildRuns,
   cleanName,
@@ -16,16 +18,23 @@ import {
   penalizeRestTap,
   pickDaily,
   playerRpm,
+  readAllPages,
+  readingOnline,
+  readingUsable,
   rpmAt,
   scoreFrame,
   segmentGrades,
   shareText,
   utcDay,
+  withTimeout,
 } from './logic.js';
 
 const STORE_KEY = 'hamster-pacer-echo.v1';
-const MAX_PAGES = 60;
+const PAGE_TIMEOUT_MS = 20000;
+const PAGE_RETRY_DELAYS_MS = [1000, 3000];
+const RUNS_MAX_AGE_MS = 60000; // opening Daily reads newer pages once the list is this old
 const STATUS_EVERY_MS = 5000;
+const STATUS_TIMEOUT_MS = 8000;
 const LULLABY_S = 60;
 const SETLIST_SIZE = 20;
 
@@ -114,21 +123,35 @@ const timeFmt = new Intl.DateTimeFormat('en-US', { hour: '2-digit', minute: '2-d
 const fmtDate = (ms) => dateFmt.format(ms);
 const fmtWhen = (ms) => `${dateFmt.format(ms)}, ${timeFmt.format(ms)} UTC`;
 const fmtLen = (s) => {
-  const m = Math.floor(s / 60);
-  const r = Math.round(s % 60);
+  const total = Math.max(1, Math.round(s));
+  const m = Math.floor(total / 60);
+  const r = total % 60;
   return m ? `${m} min ${r} s` : `${r} s`;
 };
 const fmtInt = (n) => Math.round(n).toLocaleString('en-US');
 
 // ---------- toast, sound, motion ----------
 
-let toastTimer = 0;
+// Toasts wait their turn, so one announcement never replaces another before it can be read.
+const toastQueue = [];
+let toastBusy = false;
 function toast(text) {
+  if (toastQueue.includes(text)) return;
+  toastQueue.push(text);
+  if (!toastBusy) nextToast();
+}
+
+function nextToast() {
   const t = $('#toast');
-  t.textContent = text;
+  if (!toastQueue.length) {
+    toastBusy = false;
+    t.classList.remove('show');
+    return;
+  }
+  toastBusy = true;
+  t.textContent = toastQueue.shift();
   t.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 2800);
+  setTimeout(nextToast, 2800);
 }
 
 let audio = null;
@@ -163,82 +186,165 @@ function applySettings() {
 
 const state = {
   runs: [],
-  meta: null,
+  pages: [],
   daily: null,
+  dailyDay: null, // the UTC day state.daily was chosen for
   runsLoading: true,
   runsPage: 0,
   runsError: null,
+  runsAt: 0,
   live: null,
+  liveAt: 0,
   statusError: null,
 };
 
-async function getJSON(url) {
-  const res = await fetch(url, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+async function getJSON(url, timeoutMs) {
+  return withTimeout(timeoutMs, async (signal) => {
+    const res = await fetch(url, { cache: 'no-store', signal });
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return res.json();
+  });
 }
 
-async function loadRuns() {
-  state.runsLoading = true;
-  state.runsError = null;
-  state.runsPage = 0;
-  renderDaily();
-  renderSetlist();
-  try {
-    const segments = [];
-    let cursor = null;
-    let meta = null;
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const q = new URLSearchParams({ limit: '100' });
-      if (cursor) q.set('cursor', cursor);
-      const json = await getJSON(`${API}/measurement/runs?${q}`);
-      if (!Array.isArray(json.items)) throw new Error('the runs response had no items list');
-      meta = json;
-      segments.push(...json.items);
-      cursor = json.nextCursor;
-      state.runsPage = page + 1;
-      if (page % 5 === 4) renderDaily();
-      if (!cursor || json.items.length < 100) break;
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Network errors, timeouts, rate limits and server errors get two more tries; a bad request does not.
+async function readRunsPage(cursor) {
+  const q = new URLSearchParams({ limit: '100' });
+  if (cursor != null) q.set('cursor', cursor);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await getJSON(`${API}/measurement/runs?${q}`, PAGE_TIMEOUT_MS);
+    } catch (err) {
+      const retryable = err.status == null || err.status === 429 || err.status >= 500;
+      if (!retryable || attempt >= PAGE_RETRY_DELAYS_MS.length) throw err;
+      await wait(PAGE_RETRY_DELAYS_MS[attempt]);
     }
-    state.meta = meta;
-    state.runs = buildRuns(segments);
-    const observed = Date.parse(meta.latestObservedAt || meta.coverageThroughAt) || Date.now();
-    state.daily = pickDaily(state.runs, Date.now(), observed);
-  } catch (err) {
-    state.runsError = err instanceof Error ? err.message : String(err);
   }
-  state.runsLoading = false;
-  renderDaily();
-  renderSetlist();
 }
+
+const runsSignature = () => {
+  const newest = state.runs[state.runs.length - 1];
+  return [state.runs.length, state.daily && state.daily.id, state.daily && state.daily.durS, newest && newest.id, newest && newest.durS].join('|');
+};
+
+let runsJob = null;
+
+// Reads the full history once, then only the newest pages. A new UTC day or a retry blocks Daily and
+// Setlist until the read ends, so no track is offered under a Pacer number it does not belong to.
+function refreshRuns({ blocking = false } = {}) {
+  if (runsJob) return runsJob;
+  const today = utcDay(Date.now());
+  const block = blocking || state.dailyDay !== today;
+  if (block) {
+    state.dailyDay = today;
+    state.daily = null;
+    state.runsLoading = true;
+    state.runsError = null;
+    state.runsPage = 0;
+    renderDaily();
+    renderSetlist();
+  }
+  runsJob = (async () => {
+    const before = runsSignature();
+    try {
+      const read = (known) =>
+        readAllPages(readRunsPage, known, (count) => {
+          state.runsPage = count;
+          if (state.runsLoading && count % 5 === 0) renderDaily();
+        });
+      // If the API refuses a remembered cursor, read the history again from its start.
+      const { pages, meta } = await read(state.pages).catch((err) => {
+        if (!state.pages.length || !(err.status >= 400 && err.status < 500)) throw err;
+        return read([]);
+      });
+      state.pages = pages;
+      state.runs = buildRuns(pages.flatMap((p) => p.items));
+      const observed = Date.parse(meta.latestObservedAt || meta.coverageThroughAt) || Date.now();
+      state.daily = pickDaily(state.runs, today * DAY_MS, observed);
+      state.dailyDay = today;
+      state.runsAt = Date.now();
+      state.runsError = null;
+    } catch (err) {
+      // A failed background read keeps the list on screen; a blocking one says the modes are off.
+      if (block) state.runsError = err instanceof Error ? err.message : String(err);
+    }
+    state.runsLoading = false;
+    runsJob = null;
+    if (block || before !== runsSignature()) {
+      renderDaily();
+      renderSetlist();
+    }
+  })();
+  return runsJob;
+}
+
+// Runs when Daily opens, so it never offers a selection another tab would no longer make.
+function syncDaily() {
+  if (state.dailyDay !== utcDay(Date.now())) refreshRuns();
+  else if (!state.runsError && Date.now() - state.runsAt > RUNS_MAX_AGE_MS) refreshRuns();
+}
+
+function startDaily() {
+  if (state.dailyDay !== utcDay(Date.now())) {
+    refreshRuns();
+    return;
+  }
+  if (state.daily) startTrack(state.daily, 'daily');
+}
+
+const retryRuns = () => refreshRuns({ blocking: true });
 
 async function pollStatus() {
+  const started = Date.now();
   try {
-    const json = await getJSON(`${API}/status`);
-    state.live = liveOf(json);
-    state.statusError = state.live.core ? null : 'the status response had no coreStatus';
+    const json = await getJSON(`${API}/status`, STATUS_TIMEOUT_MS);
+    const live = liveOf(json);
+    state.live = live;
+    state.liveAt = Date.now();
+    state.statusError = live.core ? null : 'the status response had no coreStatus';
   } catch (err) {
     state.live = null;
     state.statusError = err instanceof Error ? err.message : String(err);
   }
-  onStatus();
-  setTimeout(pollStatus, STATUS_EVERY_MS);
+  try {
+    onStatus();
+  } finally {
+    setTimeout(pollStatus, Math.max(0, STATUS_EVERY_MS - (Date.now() - started)));
+  }
 }
 
-const liveUsable = () => Boolean(state.live && !state.statusError);
-const duetReady = () => liveUsable() && state.live.core === 'ACTIVE' && state.live.freshness === 'online' && state.live.rpm != null;
+const liveUsable = () => !state.statusError && readingUsable(state.live, state.liveAt, Date.now());
+const liveFresh = () => !state.statusError && readingOnline(state.live, state.liveAt, Date.now());
+const duetReady = () => liveFresh() && state.live.core === 'ACTIVE' && state.live.rpm != null;
+const lullabyReady = () => liveFresh() && state.live.core === 'IDLE';
 
 function onStatus() {
   updateWheel();
   if (game && game.mode === 'duet' && !game.ended) duetStatus();
-  if (currentView === 'live') renderLive();
+  if (currentView === 'live' && !game) renderLive();
+}
+
+// Runs every second: drops a reading once updates stop, and notices a new UTC day.
+function clockTick() {
+  if (state.live && !liveUsable()) {
+    state.live = null;
+    state.statusError = state.statusError || `no update for ${STATUS_MAX_AGE_MS / 1000} seconds`;
+    onStatus();
+  }
+  if (!runsJob && state.dailyDay !== utcDay(Date.now())) refreshRuns();
 }
 
 function updateWheel() {
   const label = $('#wheel-label');
   const spokes = $('#wheel-spokes');
-  const rpm = liveUsable() && state.live.rpm ? state.live.rpm : 0;
+  const rpm = liveFresh() && state.live.rpm ? state.live.rpm : 0;
   if (!liveUsable()) label.textContent = 'Live data unavailable';
+  else if (!liveFresh()) label.textContent = `Live data ${state.live.freshness || 'not fresh'}`;
   else if (state.live.core === 'ACTIVE') label.textContent = `Running ${Math.round(rpm)} RPM`;
   else if (state.live.core === 'IDLE') label.textContent = 'Resting';
   else if (state.live.core === 'COUNTER_FAULT') label.textContent = 'Counter fault';
@@ -266,7 +372,10 @@ function showView(name) {
   else stopLullaby();
   if (name === 'stickers') renderStickers();
   if (name === 'setlist') renderSetlist();
-  if (name === 'daily') renderDaily(); // sparklines need a visible box to size against
+  if (name === 'daily') {
+    syncDaily();
+    renderDaily(); // sparklines need a visible box to size against
+  }
 }
 
 function bestLine(run) {
@@ -281,8 +390,8 @@ function runFacts(run) {
 function renderDaily() {
   const root = $('#view-daily');
   root.replaceChildren();
-  const pacer = pacerNumber(Date.now());
-  root.append(h('h2', { text: `Pacer #${pacer}` }));
+  const day = state.dailyDay ?? utcDay(Date.now());
+  root.append(h('h2', { text: `Pacer #${pacerNumber(day * DAY_MS)}` }));
   if (state.runsLoading) {
     root.append(h('p', { class: 'muted', text: `Loading recorded runs${state.runsPage ? ` (page ${state.runsPage})` : ''}…` }));
     root.append(h('button', { type: 'button', class: 'btn', disabled: true, text: 'Play Daily Track' }));
@@ -291,7 +400,7 @@ function renderDaily() {
   if (state.runsError) {
     root.append(
       h('p', { class: 'warn', text: `Recorded runs could not be loaded (${state.runsError}). Daily Track and Setlist need them, so they are off for now.` }),
-      h('button', { type: 'button', class: 'btn', text: 'Try loading again', onclick: loadRuns }),
+      h('button', { type: 'button', class: 'btn', text: 'Try loading again', onclick: retryRuns }),
     );
     return;
   }
@@ -303,9 +412,9 @@ function renderDaily() {
       h(
         'div',
         { class: 'daily-copy' },
-        h('p', { text: `Everyone plays yesterday's longest run today. ${runFacts(run)}` }),
-        h('button', { type: 'button', class: 'btn big', text: 'Play Daily Track', onclick: () => startTrack(run, 'daily') }),
-        h('p', { class: 'muted small', text: 'Tap Space or the big pad to match his speed. Stop when he pauses.' }),
+        h('p', { text: `Yesterday’s longest run. ${runFacts(run)}` }),
+        h('button', { type: 'button', class: 'btn big', text: 'Play Daily Track', onclick: startDaily }),
+        h('p', { class: 'muted small', text: 'Tap Space or the pad. Stop when he pauses.' }),
         h('p', { class: 'muted small', text: `${bestLine(run)}. Daily streak: ${store.daily.streak} days.` }),
       ),
       sparkCanvas(run, 'spark big-spark'),
@@ -313,7 +422,7 @@ function renderDaily() {
     root.append(card);
     return;
   }
-  const yesterday = (utcDay(Date.now()) - 1) * 86400000;
+  const yesterday = (day - 1) * DAY_MS;
   const newest = state.runs[state.runs.length - 1];
   const kids = [
     h('p', { class: 'warn', text: `No completed run on ${fmtDate(yesterday)} (UTC), so no Daily Track today.` }),
@@ -322,10 +431,10 @@ function renderDaily() {
     kids.push(
       h('p', { text: `His newest run: ${runFacts(newest)}` }),
       h('button', { type: 'button', class: 'btn big', text: 'Play newest run', onclick: () => startTrack(newest, 'setlist') }),
-      h('p', { class: 'muted small', text: 'Tap Space or the big pad to match his speed. Stop when he pauses.' }),
+      h('p', { class: 'muted small', text: 'Tap Space or the pad. Stop when he pauses.' }),
     );
   } else {
-    kids.push(h('p', { class: 'muted', text: 'The API has no recorded runs long enough to play yet. Check Live to see what he is doing now.' }));
+    kids.push(h('p', { class: 'muted', text: 'The API has no recorded runs yet. Check Live to see what he is doing now.' }));
   }
   root.append(h('div', { class: 'daily' }, h('div', { class: 'daily-copy' }, kids), newest ? sparkCanvas(newest, 'spark big-spark') : null));
 }
@@ -340,13 +449,13 @@ function renderSetlist() {
   if (state.runsError) {
     root.append(
       h('p', { class: 'warn', text: `Recorded runs could not be loaded (${state.runsError}).` }),
-      h('button', { type: 'button', class: 'btn', text: 'Try loading again', onclick: loadRuns }),
+      h('button', { type: 'button', class: 'btn', text: 'Try loading again', onclick: retryRuns }),
     );
     return;
   }
   const runs = state.runs.slice(-SETLIST_SIZE).reverse();
   if (!runs.length) {
-    root.append(h('p', { class: 'muted', text: 'No recorded runs are long enough to play yet. Runs need at least 15 seconds on the wheel.' }));
+    root.append(h('p', { class: 'muted', text: 'The API has no recorded runs yet.' }));
     return;
   }
   root.append(h('p', { class: 'muted', text: `His last ${runs.length} recorded runs, newest first.` }));
@@ -431,23 +540,29 @@ function renderLive() {
     stopLullaby();
     root.replaceChildren(
       h('h2', { text: 'Live' }),
-      h('p', { class: 'warn', text: `Live status is unavailable right now (${state.statusError || 'no answer yet'}). Live Duet and Lullaby are off until it returns. Checking again every 5 seconds.` }),
+      h('p', { class: 'warn', text: `Live status is unavailable right now (${state.statusError || 'no recent update'}). Live Duet and Lullaby are off until it returns. Checking again every 5 seconds.` }),
     );
     return;
   }
   const live = state.live;
+  if (!liveFresh() && live.core !== 'COUNTER_FAULT') {
+    stopLullaby();
+    root.replaceChildren(
+      h('h2', { text: 'Live' }),
+      h('p', { class: 'warn', text: `The wheel's data is ${live.freshness || 'of unknown freshness'}, not online, so it may be out of date. Live Duet and Lullaby are off until fresh readings return. Checking again every 5 seconds.` }),
+    );
+    return;
+  }
   if (live.core === 'ACTIVE') {
     stopLullaby();
     const ready = duetReady();
     root.replaceChildren(
       h('h2', { text: 'Live Duet' }),
-      h('p', { text: `He is running right now at ${Math.round(live.rpm || 0)} RPM. Pace him as it happens. Every new Squeek block during the duet pays 250 points times your Flow.` }),
+      h('p', { text: ready ? `He is running right now at ${Math.round(live.rpm)} RPM. Pace him as it happens. Every new Squeek block during the duet pays 250 points times your Flow.` : 'He is running, but the status API sent no speed reading.' }),
       h('button', { type: 'button', class: 'btn big', disabled: !ready, text: 'Start Live Duet', onclick: startDuet }),
       h('p', {
         class: 'muted small',
-        text: ready
-          ? `Data is ${live.freshness}. The curve updates every 5 seconds from the status API.`
-          : `Data freshness is ${live.freshness || 'unknown'}, so the duet waits for fresh readings.`,
+        text: ready ? `Data is ${live.freshness}. The curve updates every 5 seconds from the status API.` : 'The duet waits for a speed reading.',
       }),
     );
     return;
@@ -490,6 +605,10 @@ function startLullaby() {
 
 function updateLullaby() {
   if (!lullaby) return;
+  if (!lullabyReady()) {
+    renderLive(); // replaces the moon with the reason, and no sticker is earned on old data
+    return;
+  }
   const left = Math.max(0, LULLABY_S - (performance.now() - lullaby.since) / 1000);
   const time = $('#lull-time');
   const note = $('#lull-note');
@@ -574,11 +693,16 @@ function enterPlay(title) {
 function startTrack(run, kind) {
   stopLullaby();
   const track = makeTrack(run);
-  const title = kind === 'daily' ? `Pacer #${pacerNumber(Date.now())}` : `Run of ${fmtWhen(run.start)}`;
+  // A session keeps its day: finishing after UTC midnight still credits the Pacer it started as.
+  const startedAt = Date.now();
+  const pacer = pacerNumber(startedAt);
+  const title = kind === 'daily' ? `Pacer #${pacer}` : `Run of ${fmtWhen(run.start)}`;
   game = {
     mode: 'track',
     kind,
     title,
+    day: utcDay(startedAt),
+    pacer,
     track,
     maxRpm: track.maxRpm,
     taps: [],
@@ -629,7 +753,11 @@ function startDuet() {
 
 function duetStatus() {
   if (!duetReady()) {
-    finish(liveUsable() && state.live.core !== 'ACTIVE' ? 'He stopped running, so the duet is over.' : 'Live data dropped out, so the duet is over.');
+    let reason = 'He stopped running, so the duet is over.';
+    if (!liveUsable()) reason = `Live data is unavailable (${state.statusError || 'no recent update'}), so the duet is over.`;
+    else if (!liveFresh()) reason = `The wheel's data went ${state.live.freshness || 'out of date'}, so the duet is over.`;
+    else if (state.live.core === 'ACTIVE') reason = 'The status API stopped sending his speed, so the duet is over.';
+    finish(reason);
     return;
   }
   game.samples.push({ t: game.t, rpm: state.live.rpm });
@@ -872,7 +1000,7 @@ function finish(reason) {
     if (s.time.gold >= game.track.playS / 2) award('first-gold');
     if (perfect) award('perfect');
     if (game.kind === 'daily') {
-      store.daily = nextStreak(store.daily, utcDay(Date.now()));
+      store.daily = nextStreak(store.daily, game.day);
       award('daily1');
       if (store.daily.streak >= 5) award('streak5');
     } else if (!store.setlistDone.includes(id)) {
@@ -904,7 +1032,7 @@ function renderResult(reason, acc, accShown, grade) {
   const kids = [
     h('h2', { text: game.mode === 'duet' ? 'Duet over' : `Grade ${grade}` }),
     reason ? h('p', { text: reason }) : null,
-    name ? h('p', { text: `Nice pacing, ${name}.` }) : null,
+    name ? h('p', { class: 'player-name', text: `Nice pacing, ${name}.` }) : null,
     stats,
   ];
   if (game.mode === 'track') {
@@ -923,7 +1051,7 @@ function renderResult(reason, acc, accShown, grade) {
     const grades = segmentGrades(s);
     const label = { gold: 'gold', silver: 'silver', miss: 'miss' };
     const text = shareText({
-      title: game.kind === 'daily' ? `Hamster Pacer: Echo, Pacer #${pacerNumber(Date.now())}` : `Hamster Pacer: Echo, run of ${fmtDate(run.start)}`,
+      title: game.kind === 'daily' ? `Hamster Pacer: Echo, Pacer #${game.pacer}` : `Hamster Pacer: Echo, run of ${fmtDate(run.start)}`,
       grades,
       score: s.score,
       acc,
@@ -955,7 +1083,13 @@ function renderResult(reason, acc, accShown, grade) {
   }
   const again =
     game.mode === 'track'
-      ? h('button', { type: 'button', class: 'btn', text: 'Play again', onclick: () => startTrack(game.track.run, game.kind) })
+      ? h('button', {
+          type: 'button',
+          class: 'btn',
+          text: 'Play again',
+          // After UTC midnight this run is no longer the Daily, so a replay earns no Daily credit.
+          onclick: () => startTrack(game.track.run, game.kind === 'daily' && game.day !== utcDay(Date.now()) ? 'setlist' : game.kind),
+        })
       : duetReady()
         ? h('button', { type: 'button', class: 'btn', text: 'Duet again', onclick: startDuet })
         : null;
@@ -1068,15 +1202,26 @@ function init() {
   });
 
   const pad = $('#pad');
+  // Pointers tap on press for low latency, and then the browser also sends a click, which must not
+  // count twice. A click with no pointer or key just before it is an assistive activation.
+  let lastPadInput = -Infinity;
+  const markPadInput = () => {
+    lastPadInput = performance.now();
+  };
   pad.addEventListener('pointerdown', (e) => {
     e.preventDefault();
+    markPadInput();
     onTap();
+  });
+  pad.addEventListener('pointerup', markPadInput);
+  pad.addEventListener('click', () => {
+    if (performance.now() - lastPadInput > 500) onTap();
   });
   // Keyboard users on the focused pad: Enter taps; Space is handled globally below.
   pad.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.repeat) {
+    if (e.key === 'Enter') {
       e.preventDefault();
-      onTap();
+      if (!e.repeat) onTap();
     }
   });
   $('#quit-btn').addEventListener('click', () => quitGame(true));
@@ -1093,7 +1238,10 @@ function init() {
     }
   });
   window.addEventListener('keyup', (e) => {
-    if (game && !game.ended && (e.code === 'Space' || e.key === ' ') && !isTyping(e.target)) e.preventDefault();
+    if (game && !game.ended && (e.code === 'Space' || e.key === ' ') && !isTyping(e.target)) {
+      e.preventDefault();
+      markPadInput(); // Space on the focused pad already tapped on keydown
+    }
   });
   window.addEventListener('pointerdown', () => {
     if (lullaby) hushLullaby();
@@ -1126,8 +1274,9 @@ function init() {
   renderStickers();
   showView(location.hash.slice(1) || 'daily');
   renderDaily();
-  loadRuns();
+  refreshRuns();
   pollStatus();
+  setInterval(clockTick, 1000);
   if (!store.tutorial) showTutorial();
 }
 
